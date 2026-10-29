@@ -1,6 +1,7 @@
 """Offline regressions: exercise the real CLI, mock only the HTTP transport."""
 import contextlib
 import csv
+import http.client
 import importlib.util
 import io
 import json
@@ -48,6 +49,18 @@ class Response:
         return self.payload
 
 
+class RawResponse(Response):
+    def __init__(self, payload):
+        self.payload = payload
+
+
+def http_error(req, status, body):
+    return urllib.error.HTTPError(req.full_url, status, "mock", {}, io.BytesIO(body))
+
+
+NO_DEFAULT_KEY = str(ROOT / "tests" / "no-such-dir" / "key.env")
+
+
 class CliTests(unittest.TestCase):
     def setUp(self):
         self.stack = contextlib.ExitStack()
@@ -57,13 +70,15 @@ class CliTests(unittest.TestCase):
         self.handler = self.respond
         self.stack.enter_context(patch.dict(os.environ, {"SOCIALDATA_API_KEY": "offline-test-placeholder"}))
         self.stack.enter_context(patch.object(x, "BASE", "https://api.socialdata.tools"))
+        self.stack.enter_context(patch.object(x, "DEFAULT_KEY_FILE", NO_DEFAULT_KEY))
         self.stack.enter_context(patch.object(x.time, "sleep"))
         self.stack.enter_context(patch("socket.create_connection", side_effect=AssertionError("Live network forbidden")))
         self.stack.enter_context(patch.object(x.urllib.request, "urlopen", side_effect=self.request))
 
     def request(self, req, timeout):
         self.calls.append(req)
-        return Response(self.handler(req))
+        data = self.handler(req)
+        return data if isinstance(data, Response) else Response(data)
 
     def respond(self, req):
         url = urllib.parse.urlsplit(req.full_url)
@@ -369,17 +384,171 @@ class CliTests(unittest.TestCase):
         self.assertFalse(json.loads(out)["meta"]["complete"])
         self.assertIn("已扫描", err)
 
+    # ---- 网络、计费与完整性 ----
+    def test_proxy_403_without_api_body_reports_network_block(self):
+        def blocked(req):
+            raise http_error(req, 403, b"Forbidden by proxy policy")
+        self.handler = blocked
+        code, out, err = self.run_cli(["search", "AI", "--format", "json"])
+        self.assertEqual(code, 1)
+        self.assertEqual(len(self.calls), 1)
+        self.assertIn("允许列表", err)
+        self.assertNotIn("无权执行", err)
+
+    def test_api_403_with_json_body_keeps_key_hint(self):
+        def forbidden(req):
+            raise http_error(req, 403, b'{"message":"Forbidden"}')
+        self.handler = forbidden
+        code, out, err = self.run_cli(["search", "AI", "--format", "json"])
+        self.assertEqual(code, 1)
+        self.assertIn("无权执行", err)
+
+    def test_proxy_tunnel_failure_is_not_billed_or_retried(self):
+        def tunnel(req):
+            raise urllib.error.URLError(OSError("Tunnel connection failed: 403 Forbidden"))
+        self.handler = tunnel
+        code, out, err = self.run_cli(["search", "AI", "--format", "json"])
+        meta = json.loads(out)["meta"]
+        self.assertEqual(code, 1)
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(meta["estimated_cost_usd"], 0)
+        self.assertEqual(meta["uncertain_cost_usd"], 0)
+        self.assertIn("允许列表", err)
+
+    def test_unsent_connection_errors_are_retried_without_billing(self):
+        def refused(req):
+            raise urllib.error.URLError(ConnectionRefusedError("refused"))
+        self.handler = refused
+        code, out, err = self.run_cli(["search", "AI", "--format", "json"])
+        meta = json.loads(out)["meta"]
+        self.assertEqual(code, 1)
+        self.assertEqual(len(self.calls), 4)
+        self.assertEqual(meta["estimated_cost_usd"], 0)
+        self.assertEqual(meta["uncertain_cost_usd"], 0)
+
+    def test_invalid_json_on_success_is_billed_once_without_retry(self):
+        self.handler = lambda req: RawResponse(b"<html>not json</html>")
+        code, out, err = self.run_cli(["search", "AI", "--format", "json"])
+        meta = json.loads(out)["meta"]
+        self.assertEqual(code, 1)
+        self.assertEqual(len(self.calls), 1)
+        self.assertEqual(meta["uncertain_cost_usd"], .004)
+        self.assertIn("JSON", err)
+
+    def test_incomplete_read_is_uncertain_and_retried(self):
+        def flaky(req):
+            if len(self.calls) == 1:
+                raise http.client.IncompleteRead(b"")
+            return self.respond(req)
+        self.handler = flaky
+        code, out, err = self.run_cli(["search", "AI", "--max", "20", "--format", "json"])
+        meta = json.loads(out)["meta"]
+        self.assertEqual(code, 0)
+        self.assertEqual(len(self.calls), 2)
+        self.assertEqual(meta["uncertain_cost_usd"], .004)
+
+    def test_missing_ids_from_batch_lookup_mark_incomplete(self):
+        def partial(req):
+            if urllib.parse.urlsplit(req.full_url).path == "/twitter/tweets-by-ids":
+                return [tweet(1)]
+            return self.respond(req)
+        self.handler = partial
+        code, out, err = self.run_cli(["tweet", "1000000000000000001", "1000000000000000002", "--format", "json"])
+        meta = json.loads(out)["meta"]
+        self.assertEqual(code, 2)
+        self.assertFalse(meta["complete"])
+        self.assertIn("1000000000000000002", "".join(meta["stop_reasons"]))
+
+    def test_full_not_found_does_not_abort_discussion(self):
+        def no_article(req):
+            if "/v2/twitter/article/" in req.full_url:
+                raise http_error(req, 404, b'{"message":"Not found"}')
+            return self.respond(req)
+        self.handler = no_article
+        code, out, err = self.run_cli(["tweet", "1000000000000000001", "--full", "--comments", "1", "--format", "json"])
+        data = json.loads(out)
+        self.assertEqual(code, 0)
+        self.assertTrue(data["meta"]["complete"])
+        self.assertEqual(len(data["comments"]), 1)
+        self.assertEqual(data["full"], [])
+        self.assertTrue(data["meta"]["notes"])
+
+    # ---- 参数、查询与 dry-run ----
+    def test_reserved_x_paths_are_not_treated_as_accounts(self):
+        for ref in ["https://x.com/home", "https://x.com/search?q=AI", "https://twitter.com/i/lists/123"]:
+            with self.subTest(ref=ref):
+                code, out, err = self.run_cli(["user", ref])
+                self.assertEqual(code, 1)
+                self.assertEqual(self.calls, [])
+
+    def test_combined_queries_stay_within_limit_including_filters(self):
+        handles = [f"acct_{i:03d}_abcdef" for i in range(30)]  # 每个 15 字符，账号名上限
+        code, out, err = self.run_cli(["user", *handles, "--lang", "en", "--min-faves", "10", "--no-replies",
+                                       "--since", "2026-10-01", "--until", "2026-10-20", "--dry-run", "--format", "json"])
+        plan = json.loads(out)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.calls, [])
+        self.assertGreater(len(plan["queries"]), 1)
+        self.assertTrue(all(len(q) <= x.QUERY_LIMIT for q in plan["queries"]))
+        joined = " ".join(plan["queries"])
+        self.assertTrue(all(f"from:{h}" in joined for h in handles))
+
+    def test_dry_run_needs_no_key_and_sends_nothing(self):
+        with patch.dict(os.environ, {"SOCIALDATA_API_KEY": ""}):
+            code, out, err = self.run_cli(["search", "AI", "--max", "100", "--budget-usd", "0.5",
+                                           "--dry-run", "--format", "json"])
+        plan = json.loads(out)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.calls, [])
+        self.assertTrue(plan["dry_run"])
+        self.assertTrue(plan["needs_yes"])
+        self.assertEqual(plan["estimated_cost_usd"], .02)
+        self.assertNotIn("密钥来源", err)
+
+    def test_timeline_reports_worst_case_estimate(self):
+        code, out, err = self.run_cli(["user", "alice", "--timeline", "--dry-run", "--format", "json"])
+        plan = json.loads(out)
+        self.assertEqual(code, 0)
+        self.assertGreater(plan["worst_case_cost_usd"], plan["estimated_cost_usd"])
+        self.assertIn("最多约", err)
+
 
 class ConfigTests(unittest.TestCase):
-    def test_environment_key_has_priority_over_missing_file(self):
-        with patch.dict(os.environ, {"SOCIALDATA_API_KEY": "offline-test-placeholder"}):
-            self.assertEqual(x.load_key("does-not-exist.env"), "offline-test-placeholder")
+    def setUp(self):
+        patcher = patch.object(x, "DEFAULT_KEY_FILE", NO_DEFAULT_KEY)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def test_explicit_env_file_overrides_environment(self):
+        with patch.dict(os.environ, {"SOCIALDATA_API_KEY": "from-environment"}), temporary_folder() as folder:
+            target = Path(folder) / "local.env"
+            target.write_text("SOCIALDATA_API_KEY=from-file\n", encoding="utf-8")
+            stderr = io.StringIO()
+            with contextlib.redirect_stderr(stderr):
+                self.assertEqual(x.load_key(str(target)), "from-file")
+            self.assertIn("--env-file", stderr.getvalue())
+            self.assertNotIn("from-file", stderr.getvalue())
+
+    def test_missing_explicit_env_file_is_an_error_even_with_environment(self):
+        with patch.dict(os.environ, {"SOCIALDATA_API_KEY": "from-environment"}):
+            with self.assertRaises(x.Fatal):
+                x.load_key("does-not-exist.env")
+
+    def test_default_key_file_is_used_only_as_fallback(self):
+        with patch.dict(os.environ, {"SOCIALDATA_API_KEY": ""}), temporary_folder() as folder:
+            target = Path(folder) / "key.env"
+            target.write_text("SOCIALDATA_API_KEY=from-default\n", encoding="utf-8")
+            with patch.object(x, "DEFAULT_KEY_FILE", str(target)), contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(x.load_key(None), "from-default")
+                with patch.dict(os.environ, {"SOCIALDATA_API_KEY": "from-environment"}):
+                    self.assertEqual(x.load_key(None), "from-environment")
 
     def test_key_file_is_explicit_and_accepts_utf8_bom(self):
         with patch.dict(os.environ, {"SOCIALDATA_API_KEY": ""}), temporary_folder() as folder:
             target = Path(folder) / "local.env"
             target.write_text('SOCIALDATA_API_KEY="offline-test-placeholder"\n', encoding="utf-8-sig")
-            self.assertEqual(x.load_key(str(target)), "offline-test-placeholder")
+            with contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(x.load_key(str(target)), "offline-test-placeholder")
             with self.assertRaises(x.Fatal):
                 x.load_key(None)
 

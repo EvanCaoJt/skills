@@ -13,11 +13,14 @@
 import argparse
 import csv
 import html
+import http.client
 import io
 import json
 import math
 import os
 import re
+import socket
+import ssl
 import sys
 import time
 import urllib.error
@@ -36,6 +39,17 @@ PAUSE = 0.5  # 限速 120 次/分钟
 DEFAULT_BUDGET = Decimal("0.20")
 UNIT_PRICE = Decimal("0.0002")
 PAGE_ITEMS = 20  # 官方约 20 条/页，接口无法保证页大小；见预算说明
+QUERY_LIMIT = 450  # 整条搜索语句的保守长度上限；官方未公布，超长查询可能报错或被截断
+DEFAULT_KEY_FILE = os.path.join(os.path.expanduser("~"), ".config", "socialdata", "key.env")
+# x.com 上不是账号主页的一级路径，避免把它们当成账号去付费查询
+RESERVED_PATHS = {
+    "home", "i", "search", "explore", "notifications", "messages", "settings", "compose", "intent",
+    "hashtag", "share", "login", "logout", "signup", "tos", "privacy", "jobs", "lists", "communities",
+    "bookmarks", "premium", "account", "download", "about", "help",
+}
+NETWORK_HINT = ("请求被网络代理或沙箱拦截，没有到达 SocialData。在 Claude 中运行时，需要在网络访问设置的"
+                "域名允许列表中加入 api.socialdata.tools（团队版由组织管理员在 Admin settings → Capabilities 配置）；"
+                "也可在能直连的本机终端运行。这不是密钥问题")
 TITLES = {"tweets": "推文", "full": "全文（长文 / 长帖）", "thread": "同一线程", "comments": "回复", "quotes": "引用本帖的推文"}
 HINTS = {
     401: "密钥无效或缺失，检查 SOCIALDATA_API_KEY",
@@ -64,30 +78,62 @@ def log(msg):
 
 
 # ---------- 密钥与 HTTP ----------
-def load_key(path):
-    key = os.environ.get("SOCIALDATA_API_KEY", "").strip()
-    if not key and path:
-        if not os.path.isfile(path):
-            raise Fatal(f"--env-file 不存在: {path}")
-        try:
-            with open(path, encoding="utf-8-sig") as f:
-                for line in f:
-                    m = re.match(r"\s*(?:export\s+)?SOCIALDATA_API_KEY\s*=\s*(.*?)\s*$", line)
-                    if m:
-                        key = m.group(1).strip("'\"")
-        except (OSError, UnicodeError) as e:
-            raise Fatal("无法读取密钥配置文件；检查权限并保存为 UTF-8") from e
-    if not key:
-        raise Fatal("缺少 SOCIALDATA_API_KEY：设置环境变量，或用 --env-file 指向含 SOCIALDATA_API_KEY=... 的文件")
+def _read_key_file(path):
+    key = ""
+    try:
+        with open(path, encoding="utf-8-sig") as f:
+            for line in f:
+                m = re.match(r"\s*(?:export\s+)?SOCIALDATA_API_KEY\s*=\s*(.*?)\s*$", line)
+                if m:
+                    key = m.group(1).strip("'\"")
+    except (OSError, UnicodeError) as e:
+        raise Fatal("无法读取密钥配置文件；检查权限并保存为 UTF-8") from e
     return key
 
 
+def load_key(path):
+    """优先级：显式 --env-file > 环境变量 > 默认文件 ~/.config/socialdata/key.env（仅当存在时）。"""
+    if path:
+        if not os.path.isfile(path):
+            raise Fatal(f"--env-file 不存在: {path}")
+        key = _read_key_file(path)
+        if not key:
+            raise Fatal(f"--env-file 中没有 SOCIALDATA_API_KEY=...: {path}")
+        log("密钥来源：--env-file 指定的文件")
+        return key
+    key = os.environ.get("SOCIALDATA_API_KEY", "").strip()
+    if key:
+        log("密钥来源：环境变量 SOCIALDATA_API_KEY")
+        return key
+    if os.path.isfile(DEFAULT_KEY_FILE):
+        key = _read_key_file(DEFAULT_KEY_FILE)
+        if key:
+            log(f"密钥来源：默认文件 {DEFAULT_KEY_FILE}")
+            return key
+    raise Fatal("缺少 SOCIALDATA_API_KEY：设置环境变量，用 --env-file 指向含 SOCIALDATA_API_KEY=... 的文件，"
+                f"或在本机创建 {DEFAULT_KEY_FILE}")
+
+
 def _message(e):
+    """返回 (消息, 是否来自 SocialData 的 JSON 响应体)。"""
     try:
         body = json.loads(e.read().decode("utf-8", "replace"))
-        return body.get("message") or body.get("error") or str(body)
     except Exception:
-        return str(getattr(e, "reason", "") or "")
+        return str(getattr(e, "reason", "") or ""), False
+    if isinstance(body, dict):
+        return str(body.get("message") or body.get("error") or body), True
+    return str(body), True
+
+
+def _blocked(e):
+    """HTTPS 代理拒绝建立隧道（沙箱允许列表外的域名常见此错误）。"""
+    return "Tunnel connection failed" in str(getattr(e, "reason", e))
+
+
+def _unsent(e):
+    """连接建立前就失败：请求没有到达服务端，不会计费。"""
+    reason = e.reason if isinstance(e, urllib.error.URLError) else e
+    return _blocked(e) or isinstance(reason, (socket.gaierror, ConnectionRefusedError, ssl.SSLCertVerificationError))
 
 
 def _retry_after(e):
@@ -106,7 +152,7 @@ class Client:
         self.limit = int(budget / UNIT_PRICE)
         self.page_items = PAGE_ITEMS
         self.sections, self.users, self.queries = {}, [], []
-        self.complete, self.reasons = True, []
+        self.complete, self.reasons, self.notes = True, [], []
         self.checkpoint = checkpoint
         if checkpoint:
             parent = os.path.dirname(os.path.abspath(checkpoint))
@@ -125,6 +171,20 @@ class Client:
         self.complete = False
         if reason not in self.reasons:
             self.reasons.append(reason)
+
+    def note(self, message):
+        log(message)
+        if message not in self.notes:
+            self.notes.append(message)
+
+    def _invalid(self, path, params, body, response, expected, reason):
+        # 成功状态码下的异常响应很可能已计费：保守计一次，不重试。
+        self.units += expected
+        self.uncertain_units += expected
+        self.journal({"event": "invalid_response", "path": path, "params": params,
+                      "body": body, "response": response, "reserved_units": expected,
+                      "cumulative_estimated_units": self.units})
+        raise Fatal(f"{reason}，停止请求；已保留此前结果")
 
     def record(self, section, tweet):
         self.sections.setdefault(section, []).append(tweet)
@@ -181,36 +241,13 @@ class Client:
             req = urllib.request.Request(url, data=data, headers=headers, method="POST" if data else "GET")
             try:
                 with urllib.request.urlopen(req, timeout=60) as r:
-                    response = json.loads(r.read().decode("utf-8"))
-                if page:
-                    objects = response.get("tweets") if isinstance(response, dict) else response
-                elif body is not None:
-                    objects = (response if isinstance(response, list) else
-                               response.get("tweets", response.get("users")) if isinstance(response, dict) else None)
-                else:
-                    objects = [response]
-                if (not isinstance(objects, list) or not all(isinstance(obj, dict) and
-                        re.fullmatch(r"\d{1,25}", str(obj.get("id_str") or obj.get("id") or ""))
-                        for obj in objects)):
-                    self.units += expected
-                    self.uncertain_units += expected
-                    self.journal({"event": "invalid_response", "path": path, "params": params,
-                                  "body": body, "response": response, "reserved_units": expected,
-                                  "cumulative_estimated_units": self.units})
-                    raise Fatal("接口响应结构无效，停止请求；已保留此前结果")
-                charged = max(1, len(objects))  # 空结果也可能触发公平使用计费，保守估算
-                self.units += charged
-                if page:
-                    self.page_items = max(self.page_items, charged)
-                self.journal({"event": "response", "path": path, "params": params, "body": body,
-                              "response": response, "estimated_units": charged,
-                              "cumulative_estimated_units": self.units})
-                if self.units > self.limit:
-                    self.partial("接口返回页大于预留数量，估算费用超出预算；停止后续请求")
-                    log(self.reasons[-1])
-                return response
+                    payload = r.read()
             except urllib.error.HTTPError as e:
-                msg = str(_message(e)).replace(self.key, "[REDACTED]")
+                msg, from_api = _message(e)
+                msg = msg.replace(self.key, "[REDACTED]")
+                if e.code in (403, 407) and not from_api:
+                    # SocialData 的错误都带 JSON 响应体；没有的 403/407 来自中间代理
+                    raise Fatal(f"HTTP {e.code}：{NETWORK_HINT}")
                 if e.code in (429, 500, 502, 503, 504) and attempt < 3:
                     wait = _retry_after(e)
                     wait = 2 ** (attempt + 1) if wait is None else wait
@@ -219,17 +256,57 @@ class Client:
                     continue
                 text = f"HTTP {e.code}: {msg}" + (f"——{HINTS[e.code]}" if e.code in HINTS else "")
                 raise (NotFound if e.code == 404 else Fatal)(text)
-            except (urllib.error.URLError, TimeoutError, ConnectionError, json.JSONDecodeError) as e:
-                # A response may have been billed even if it never reached this process.
+            except (OSError, http.client.HTTPException) as e:  # URLError、超时、连接中断、读取不完整
+                detail = str(getattr(e, "reason", e) or e).replace(self.key, "[REDACTED]")
+                if _blocked(e):
+                    self.journal({"event": "blocked_request", "path": path, "params": params, "error": detail})
+                    raise Fatal(NETWORK_HINT)
+                if _unsent(e):
+                    # DNS 失败、连接被拒、证书校验失败：请求没有发出，不计费，只做有限重试
+                    self.journal({"event": "unsent_request", "path": path, "params": params, "error": detail})
+                    if attempt < 3:
+                        log(f"无法连接（{detail}），{2 ** (attempt + 1)}s 后重试 {attempt + 1}/3")
+                        time.sleep(2 ** (attempt + 1))
+                        continue
+                    raise Fatal(f"无法连接 SocialData：{detail}。在 Claude 沙箱中运行时，"
+                                "确认网络允许列表已加入 api.socialdata.tools")
+                # 请求已发出但响应丢失：服务端可能已计费，保守计入不确定费用后重试
                 self.units += expected
                 self.uncertain_units += expected
                 self.journal({"event": "uncertain_request", "path": path, "params": params,
-                              "body": body, "reserved_units": expected,
+                              "body": body, "reserved_units": expected, "error": detail,
                               "cumulative_estimated_units": self.units})
                 if attempt < 3:
                     time.sleep(2 ** (attempt + 1))
                     continue
-                raise Fatal(f"网络或响应解析错误: {str(e).replace(self.key, '[REDACTED]')}")
+                raise Fatal(f"网络错误: {detail}")
+            try:
+                response = json.loads(payload)
+            except ValueError:
+                self._invalid(path, params, body, payload[:2000].decode("utf-8", "replace"),
+                              expected, "接口返回的内容不是有效 JSON")
+            if page:
+                objects = response.get("tweets") if isinstance(response, dict) else response
+            elif body is not None:
+                objects = (response if isinstance(response, list) else
+                           response.get("tweets", response.get("users")) if isinstance(response, dict) else None)
+            else:
+                objects = [response]
+            if (not isinstance(objects, list) or not all(isinstance(obj, dict) and
+                    re.fullmatch(r"\d{1,25}", str(obj.get("id_str") or obj.get("id") or ""))
+                    for obj in objects)):
+                self._invalid(path, params, body, response, expected, "接口响应结构无效")
+            charged = max(1, len(objects))  # 空结果也可能触发公平使用计费，保守估算
+            self.units += charged
+            if page:
+                self.page_items = max(self.page_items, charged)
+            self.journal({"event": "response", "path": path, "params": params, "body": body,
+                          "response": response, "estimated_units": charged,
+                          "cumulative_estimated_units": self.units})
+            if self.units > self.limit:
+                self.partial("接口返回页大于预留数量，估算费用超出预算；停止后续请求")
+                log(self.reasons[-1])
+            return response
 
 
 # ---------- 解析工具 ----------
@@ -274,6 +351,8 @@ def tweet_id(t):
 
 def handle_of(s):
     m = re.search(r"(?:x|twitter)\.com/@?([A-Za-z0-9_]{1,15})(?:[/?#]|$)", s)
+    if m and m.group(1).lower() in RESERVED_PATHS:
+        raise Fatal(f"不是账号主页链接: {s!r}")
     h = m.group(1) if m else s.strip().lstrip("@")
     if not re.fullmatch(r"[A-Za-z0-9_]{1,15}", h):
         raise Fatal(f"账号名无效: {s!r}")
@@ -331,7 +410,7 @@ def collect(c, path, params, limit, keep=None, stop=None, section="tweets"):
     return out[:limit]
 
 
-def search_ops(a, tz):
+def search_ops(a):
     ops = []
     if a.start_time:
         ops.append(f"since_time:{int(a.start_time.timestamp())}")
@@ -380,22 +459,53 @@ def timeline(c, handle, a, tz):
     return collect(c, path, {}, a.max, keep=keep, stop=too_old)
 
 
-def chunks(handles, size, per_account):
+def who_clause(handles):
+    return f"from:{handles[0]}" if len(handles) == 1 else "(" + " OR ".join(f"from:{h}" for h in handles) + ")"
+
+
+def chunks(handles, size, per_account, room=QUERY_LIMIT):
+    """把账号分批合并成 from: 子句；room 是扣除过滤条件后留给账号部分的长度。"""
+    for h in handles:
+        if len(who_clause([h])) > room:
+            raise Fatal(f"过滤条件过长，单个账号的查询也超过 {QUERY_LIMIT} 字符；请精简条件")
     if per_account:
         return [[h] for h in handles]
     out, cur = [], []
     for h in handles:
-        if cur and (len(cur) >= size or len(" OR ".join(f"from:{x}" for x in cur + [h])) > 380):
+        if cur and (len(cur) >= size or len(who_clause(cur + [h])) > room):
             out.append(cur)
             cur = []
         cur.append(h)
     return out + [cur] if cur else out
 
 
-def cmd_search(c, a, tz):
-    ops = search_ops(a, tz)
+def search_query(a):
+    ops = search_ops(a)
     base = f"({a.query})" if ops and " OR " in a.query else a.query  # OR 的优先级高于空格(AND)，带过滤条件时先加括号
-    q = " ".join([base] + ops)
+    return " ".join([base] + ops)
+
+
+def user_queries(a):
+    """合并搜索模式下每一批账号的完整查询语句（含过滤条件），整条长度不超过 QUERY_LIMIT。"""
+    tail = " ".join(search_ops(a))
+    room = QUERY_LIMIT - (len(tail) + 1 if tail else 0)
+    return [" ".join(filter(None, [who_clause(ch), tail])) for ch in chunks(a.handles, a.batch, a.per_account, room)]
+
+
+def planned_queries(a):
+    if a.cmd == "search":
+        return [search_query(a)]
+    if a.cmd == "user":
+        return [f"timeline:@{h}" for h in a.handles] if a.timeline else user_queries(a)
+    if a.cmd == "tweet":
+        return [f"tweet:{i}" for i in a.refs]
+    if a.cmd == "list":
+        return [f"list:{a.list_id}"]
+    return [f"profile:@{h}" for h in a.handles]
+
+
+def cmd_search(c, a, tz):
+    q = search_query(a)
     c.queries.append(q)
     return {"tweets": collect(c, "/twitter/search", {"query": q, "type": a.type}, a.max)}, [q]
 
@@ -413,15 +523,11 @@ def cmd_user(c, a, tz):
                 log(f"@{h}: {e}")
                 c.partial(f"@{h}: {e}")
         return {"tweets": out}, queries
-    ops = search_ops(a, tz)
-    parts = chunks(handles, a.batch, a.per_account)
-    for ch in parts:
-        who = f"from:{ch[0]}" if len(ch) == 1 else "(" + " OR ".join(f"from:{h}" for h in ch) + ")"
-        q = " ".join([who] + ops)
+    for q in user_queries(a):
         queries.append(q)
         c.queries.append(q)
         out += collect(c, "/twitter/search", {"query": q, "type": "Latest"}, a.max)
-    if len(parts) > 1 and not a.per_account:  # 多批合并：总体取最新 --max 条
+    if len(queries) > 1 and not a.per_account:  # 多批合并：总体取最新 --max 条
         out = order(dedupe(out), "new")[: a.max]
     return {"tweets": out}, queries
 
@@ -439,11 +545,19 @@ def cmd_tweet(c, a, tz):
             d = c.call("/twitter/tweets-by-ids", body={"ids": ids[i : i + 100]})
             got = d if isinstance(d, list) else d.get("tweets", [])
             main += got
+        returned = {tweet_id(t) for t in main}
+        missing = [i for i in ids if i not in returned]
+        if missing:  # 批量接口对已删除、受保护或错误的 ID 静默不返回
+            c.partial("未返回的推文（可能已删除、受保护或 ID 错误）: " + ", ".join(missing))
+            log(c.reasons[-1])
     sec = {"tweets": main}
     if a.full:  # 长文 / 被截断的长帖：接口按「帖子 ID」返回 Markdown，每条 $0.0002
         sec["full"] = c.sections.setdefault("full", [])
         for i in ids:
-            sec["full"].append(c.call(f"/v2/twitter/article/{i}"))
+            try:
+                sec["full"].append(c.call(f"/v2/twitter/article/{i}"))
+            except NotFound:  # 普通短帖没有长文；不影响后续线程、回复和引用
+                c.note(f"{i}: 没有可读取的长文或长帖全文")
     if a.thread:
         sec["thread"] = collect(c, f"/twitter/thread/{ids[0]}", {}, a.max,
                                 keep=lambda t: tweet_id(t) != ids[0], section="thread")
@@ -641,6 +755,8 @@ def render_tweets(sections, raw, queries, a, tz, meta):
              "- 查询：" + "；".join(f"`{q}`" for q in queries)]
     if meta.get("stop_reasons"):
         lines.append("- 停止原因：" + "；".join(meta["stop_reasons"]))
+    if meta.get("notes"):
+        lines.append("- 说明：" + "；".join(meta["notes"]))
     if meta.get("range"):
         lines.append(f"- 时间范围（{a.tz}）：{meta['range']}")
     for k, v in recs.items():
@@ -691,6 +807,8 @@ def build_parser():
     common.add_argument("--yes", action="store_true", help="确认显式设置超过 0.20 美元的预算；不会取消预算上限")
     common.add_argument("--checkpoint", help="保存原始响应的 JSONL 检查点；指定 --out 时默认 <out>.checkpoint.jsonl")
     common.add_argument("--csv-mode", choices=["safe", "raw"], default="safe", help="safe 防护表格公式前缀；raw 仅供程序导入")
+    common.add_argument("--dry-run", action="store_true",
+                        help="只输出将执行的查询和费用估算，不读取密钥、不发请求、不写文件")
     cap = argparse.ArgumentParser(add_help=False)
     cap.add_argument("--max", type=int, default=50, help="最多返回条数（默认 50；每页约 20 条，每条约 $0.0002）")
     flt = argparse.ArgumentParser(add_help=False)
@@ -781,9 +899,13 @@ def validate_args(a):
         a.list_id = list_id_of(a.list_id)
     if a.raw and a.format not in ("json", "jsonl"):
         raise Fatal("--raw 仅支持 json/jsonl 格式")
+    if a.cmd == "search" and len(search_query(a)) > QUERY_LIMIT:
+        log(f"警告：查询语句 {len(search_query(a))} 字符，超过保守上限 {QUERY_LIMIT}，可能报错或被截断")
+    units = estimate_units(a)  # 合并搜索的整条查询过长时在这里报错，早于任何请求
+    if a.dry_run:
+        return tz, None
     if a.budget_usd > DEFAULT_BUDGET and not a.yes:
         raise Fatal(f"预算 ${a.budget_usd} 超过 $0.20；告知用户估算后使用 --yes 确认")
-    units = estimate_units(a)
     if units * UNIT_PRICE > a.budget_usd:
         raise Fatal(f"按目标条数及约 20 条/页估算约需 ${units * UNIT_PRICE:.4f}，"
                     f"超过预算 ${a.budget_usd}；调低条数或显式提高 --budget-usd（超过 $0.20 需 --yes）")
@@ -799,7 +921,7 @@ def validate_args(a):
     canonical = [os.path.normcase(os.path.realpath(path)) for path in files]
     if len(set(canonical)) != len(canonical):
         raise Fatal("输出、检查点和元数据不能指向同一文件")
-    protected = [os.path.normcase(os.path.realpath(path)) for path in (__file__, a.env_file) if path]
+    protected = [os.path.normcase(os.path.realpath(path)) for path in (__file__, a.env_file, DEFAULT_KEY_FILE) if path]
     if set(canonical) & set(protected):
         raise Fatal("输出文件不能覆盖脚本或密钥配置文件")
     # Detect unwritable output paths before any paid calls, without truncating an existing result.
@@ -815,7 +937,8 @@ def validate_args(a):
     return tz, checkpoint
 
 
-def estimate_units(a):
+def estimate_units(a, worst=False):
+    """按目标条数估算对象数。worst=True 时按时间线客户端过滤的最大扫描量（collect 的 cap）估算。"""
     pages = lambda n: ((n + PAGE_ITEMS - 1) // PAGE_ITEMS) * PAGE_ITEMS
     if a.cmd == "profile":
         return len(a.handles)
@@ -823,10 +946,28 @@ def estimate_units(a):
         return pages(a.max)
     if a.cmd == "user":
         if a.timeline:
-            return len(a.handles) * (1 + pages(a.max))
-        return len(chunks(a.handles, a.batch, a.per_account)) * pages(a.max)
+            scan = a.max * 5 + 40 if worst else a.max
+            return len(a.handles) * (1 + pages(scan))
+        return len(user_queries(a)) * pages(a.max)
     return (len(a.refs) * (1 + int(a.full)) + (pages(a.max) if a.thread else 0)
             + pages(a.comments) + pages(a.quotes))
+
+
+def render_plan(a, typical, worst):
+    plan = {"dry_run": True, "command": a.cmd, "queries": planned_queries(a),
+            "estimated_cost_usd": round(float(typical), 4), "worst_case_cost_usd": round(float(worst), 4),
+            "budget_usd": float(a.budget_usd),
+            "needs_yes": a.budget_usd > DEFAULT_BUDGET,
+            "within_budget": typical <= a.budget_usd}
+    if a.format in ("json", "jsonl"):
+        return json.dumps(plan, ensure_ascii=False, indent=2 if a.format == "json" else None) + "\n"
+    lines = ["# 执行计划（未发送请求）", "", f"- 命令：`{a.cmd}`",
+             "- 查询：" + "；".join(f"`{q}`" for q in plan["queries"]),
+             f"- 估算费用：约 ${plan['estimated_cost_usd']:.4f}"
+             + (f"（最多约 ${plan['worst_case_cost_usd']:.4f}）" if worst > typical else ""),
+             f"- 预算：${plan['budget_usd']:g}" + ("，超过 $0.20，正式运行需 --yes" if plan["needs_yes"] else ""),
+             "- 结论：" + ("在预算内" if plan["within_budget"] else "超出预算，需调低条数或提高 --budget-usd")]
+    return "\n".join(lines) + "\n"
 
 
 def write_output(text, path):
@@ -848,7 +989,7 @@ def write_output(text, path):
 def finish(c, a, tz, result=None):
     meta = {"queries": c.queries, "estimated_cost_usd": round(c.billed, 4), "requests": c.requests,
             "budget_usd": float(c.budget), "uncertain_cost_usd": float(c.uncertain_units * UNIT_PRICE),
-            "complete": c.complete, "stop_reasons": c.reasons,
+            "complete": c.complete, "stop_reasons": c.reasons, "notes": c.notes,
             "fetched_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
     if a.cmd == "profile":
         users = result if result is not None else c.users
@@ -890,8 +1031,14 @@ def main(argv=None):
     exit_code = 0
     try:
         tz, checkpoint = validate_args(a)
-        log(f"目标条数估算约 ${estimate_units(a) * UNIT_PRICE:.4f}；整次任务预算 ${a.budget_usd}。"
-            "整页、过滤和重试可能增加消耗；不是实际账单")
+        typical = estimate_units(a) * UNIT_PRICE
+        worst = estimate_units(a, worst=True) * UNIT_PRICE
+        log(f"目标条数估算约 ${typical:.4f}"
+            + (f"，客户端过滤需多翻页时最多约 ${min(worst, a.budget_usd):.4f}" if worst > typical else "")
+            + f"；整次任务预算 ${a.budget_usd}。整页、过滤和重试可能增加消耗；不是实际账单")
+        if a.dry_run:
+            sys.stdout.write(render_plan(a, typical, worst))
+            return 0
         c = Client(load_key(a.env_file), a.budget_usd, checkpoint)
         result, queries = a.fn(c, a, tz)
     except (Fatal, OSError) as e:
